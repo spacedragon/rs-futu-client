@@ -18,6 +18,7 @@ use crate::{ClientError, protos};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::BytesMut;
+use crate::commands::ProtoId;
 
 type Resp = Option<Payload>;
 type Req = Payload;
@@ -75,7 +76,7 @@ impl ClientActor {
         };
         let mut body = BytesMut::with_capacity(keep_alive.encoded_len());
         if let Ok(()) = keep_alive.encode(&mut body) {
-            let payload = self.create_payload(1004, body);
+            let payload = self.create_payload(ProtoId::KeepAlive as u32, body);
             if let Some(ref mut cell) = self.cell {
                 debug!("sending heart beat");
                 cell.write(payload);
@@ -162,7 +163,7 @@ impl StreamHandler<Result<Payload, Error>> for ClientActor {
                 if let Some(tx) = self.promises.remove(val.serial_no as u64) {
                     let _ = tx.send(Ok(Some(val)));
                 } else {
-                    if val.proto_id == 1004 {
+                    if val.proto_id == ProtoId::KeepAlive as u32 {
                         if log_enabled!(Level::Debug) {
                             use prost::Message;
                             if let Ok(resp) = protos::keep_alive::Response::decode(val.body) {
