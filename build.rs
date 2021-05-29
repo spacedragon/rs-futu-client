@@ -1,5 +1,5 @@
 use std::io::Result;
-use std::{fs, io};
+use std::{fs};
 
 fn main() -> Result<()> {
     let entries = fs::read_dir("./protos")?

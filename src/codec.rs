@@ -1,86 +1,58 @@
 use actix_codec::{Decoder, Encoder};
-use std::io::{self, Read};
-use bytes::{BytesMut, BufMut, Buf};
+use bytes::{BytesMut, BufMut};
 use serde::{Serialize, Deserialize};
 use bincode::Options;
-use ::prost::Message;
 use sha1::{Sha1, Digest};
-use crate::protos;
-
-use std::io::ErrorKind;
-use num_traits::FromPrimitive;
-
-
-
-
-pub enum ClientRequest {
-    InitConnect(u32, protos::init_connect::Request),
-    GetGlobalState(u32, protos::get_global_state::Request)
-}
-
-#[derive(FromPrimitive)]
-pub enum Command {
-    InitConnect = 1001,
-    GetGlobalState = 1002
-}
-
-pub enum ClientResponse {
-    InitConnect(u32, protos::init_connect::Response),
-    GetGlobalState(u32, protos::get_global_state::Response)
-}
+use anyhow::Result;
 
 pub struct ClientCodec;
 
+#[derive(Debug)]
+pub struct Payload {
+    pub proto_id: u32,
+    pub serial_no: u32,
+    pub body: BytesMut
+}
+
+pub struct ErrPayload {
+    pub proto_id: u32,
+    pub serial_no: u32,
+}
 
 impl Decoder for ClientCodec {
-    type Item = ClientResponse;
-    type Error = io::Error;
+    type Item = Payload;
+    type Error = anyhow::Error;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        let header = Header::deserialize(src).expect("parse header failed");
-        let body_len = header.n_body_len as usize;
-        let mut body_buf = &src[HEADER_LEN..(HEADER_LEN + body_len)];
-
-        match FromPrimitive::from_u32(header.n_proto_id) {
-            Some(Command::InitConnect) => {
-                let msg = protos::init_connect::Response::decode(body_buf)?;
-                Ok(Some(ClientResponse::InitConnect(header.n_serial_no, msg)))
-            },
-            Some(Command::GetGlobalState) => {
-                let msg = protos::get_global_state::Response::decode(body_buf)?;
-                Ok(Some(ClientResponse::GetGlobalState(header.n_serial_no, msg)))
-            },
-            _ => {
-                println!("Unhandled command {}", header.n_proto_id);
-                return Ok(None)
-            }
+        if src.len()< HEADER_LEN {
+            return Ok(None)
         }
+        let mut header_buf = src.split_to(HEADER_LEN);
+        let header = Header::deserialize(&mut header_buf)?;
+        let body_len = header.n_body_len as usize;
+        if src.len() < body_len {
+            return Ok(None)
+        }
+        let body_buf = src.split_to(body_len);
+        Ok(Some(Payload{
+            proto_id: header.n_proto_id,
+            serial_no: header.n_serial_no,
+            body: body_buf
+        }))
     }
 }
 
-impl Encoder<ClientRequest> for ClientCodec {
-    type Error = io::Error;
+impl Encoder<Payload> for ClientCodec {
+    type Error = anyhow::Error;
 
-    fn encode(
-        &mut self,
-        msg: ClientRequest,
-        dst: &mut BytesMut,
-    ) -> Result<(), Self::Error> {
-        let (cmd, seq_no, message) = match msg {
-            ClientRequest::InitConnect(seq_no, body) => (Command::InitConnect, seq_no, body),
-            _ => return Result::Err(io::Error::new(ErrorKind::Other, "Unsupported request type"))
-        };
-        let body_len = message.encoded_len();
-        let mut body_buf: Vec<u8> = Vec::with_capacity(body_len);
-        message.encode(&mut body_buf)?;
-
+    fn encode(&mut self, req: Payload, dst: &mut BytesMut) -> Result<(), Self::Error> {
+        let body_len = req.body.len();
         let mut hasher = Sha1::new();
-        hasher.update(&body_buf);
+        hasher.update(&req.body);
         let body_sha = hasher.finalize();
-
-        let header = Header::new(cmd as u32, seq_no, body_len as u32, <[u8; 20]>::from(body_sha));
-        header.serialize(dst).expect("write header failed.");
-        dst.put_slice(&body_buf);
+        let header = Header::new(req.proto_id, req.serial_no, body_len as u32, body_sha.into());
+        header.serialize(dst)?;
+        dst.extend_from_slice(&req.body);
         Ok(())
     }
 }
