@@ -5,11 +5,9 @@ use actix_tls::connect::{default_connector, Connect, ConnectError, Connection};
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 use log::{debug, error, log_enabled, info, warn, Level};
-
 use tokio::io::{split, WriteHalf};
-use tokio::sync::oneshot;
+use tokio::sync::{watch, oneshot};
 use tokio_util::codec::FramedRead;
-
 use crate::codec::{Payload, ClientCodec};
 use intmap::IntMap;
 use tokio::sync::oneshot::{Sender};
@@ -18,7 +16,8 @@ use crate::{ClientError, protos};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::BytesMut;
-use crate::commands::ProtoId;
+use crate::commands::{ProtoId, Notify};
+use num_traits::*;
 
 type Resp = Option<Payload>;
 type Req = Payload;
@@ -26,7 +25,8 @@ type Req = Payload;
 #[derive(Debug)]
 pub enum Command {
     Request(u32, BytesMut),
-    KeepAlive(Duration)
+    KeepAlive(Duration),
+    Notify(watch::Sender<Notify>),
 }
 
 impl Message for Command {
@@ -41,6 +41,7 @@ pub struct ClientActor {
     cell: Option<actix::io::FramedWrite<Req, WriteHalf<TcpStream>, ClientCodec>>,
     promises: IntMap<Sender<Result<Resp>>>,
     seq_no: AtomicU32,
+    watch: Option<watch::Sender<Notify>>,
 }
 
 impl ClientActor {
@@ -59,7 +60,8 @@ impl ClientActor {
             cell: None,
             backoff,
             promises: IntMap::new(),
-            seq_no: AtomicU32::new(1)
+            seq_no: AtomicU32::new(1),
+            watch: None,
         })
     }
 
@@ -89,11 +91,10 @@ impl ClientActor {
         let payload = Payload {
             body,
             proto_id,
-            serial_no
+            serial_no,
         };
         payload
     }
-
 }
 
 impl Actor for ClientActor {
@@ -163,16 +164,37 @@ impl StreamHandler<Result<Payload, Error>> for ClientActor {
                 if let Some(tx) = self.promises.remove(val.serial_no as u64) {
                     let _ = tx.send(Ok(Some(val)));
                 } else {
-                    if val.proto_id == ProtoId::KeepAlive as u32 {
-                        if log_enabled!(Level::Debug) {
-                            use prost::Message;
-                            if let Ok(resp) = protos::keep_alive::Response::decode(val.body) {
-                                if let Some(s2c) = resp.s2c {
-                                    debug!("heart beat resp, service time is {}", s2c.time)
+                    match ProtoId::from_u32(val.proto_id) {
+                        Some(ProtoId::KeepAlive) => {
+                            if log_enabled!(Level::Debug) {
+                                use prost::Message;
+                                if let Ok(resp) = protos::keep_alive::Response::decode(val.body) {
+                                    if let Some(s2c) = resp.s2c {
+                                        debug!("heart beat resp, service time is {}", s2c.time)
+                                    }
                                 }
                             }
                         }
-                    }
+                        Some(ProtoId::Notify) => {
+                            if let Some(sender) = &self.watch {
+                                use prost::Message;
+                                if let Ok(notify) =  Notify::decode(val.body) {
+                                    if let Err(e) = sender.send(notify) {
+                                        error!("send notify failed. {}", e);
+                                    }
+                                } else {
+                                    error!("invalid notify returned from server")
+                                }
+                            } else {
+                                debug!("notify ignored, no receiver.")
+                            };
+                        }
+                        _ => {
+                            if log_enabled!(Level::Warn) {
+                                warn!("unhandled server response proto:id {}, seq_no: {}", val.proto_id, val.serial_no);
+                            }
+                        }
+                    };
                 }
             }
         }
@@ -184,29 +206,57 @@ impl Handler<Command> for ClientActor {
 
     fn handle(&mut self, msg: Command, ctx: &mut Self::Context) -> Self::Result {
         if self.cell.is_none() {
-            return Box::pin(async {Err(anyhow::Error::from(ClientError::NotConnected))});
+            return Box::pin(async { Err(anyhow::Error::from(ClientError::NotConnected)) });
         }
         match msg {
             Command::Request(proto_id, body) => {
                 let (tx, rx) = oneshot::channel();
                 let payload = self.create_payload(proto_id, body);
-                self.promises.insert(payload.serial_no as u64,tx);
+                self.promises.insert(payload.serial_no as u64, tx);
                 if let Some(ref mut cell) = self.cell {
                     cell.write(payload);
                 }
                 Box::pin(async move {
                     rx.await.map_err(|_| ClientError::Disconnected)?
                 })
-            },
+            }
             Command::KeepAlive(interval) => {
                 info!("send heart beat every {} secs", interval.as_secs());
-                ctx.run_interval(interval, move|act,_| {
+                ctx.run_interval(interval, move |act, _| {
                     act.hb()
                 });
-                Box::pin(async  { Ok(None) })
+                Box::pin(async { Ok(None) })
+            }
+            Command::Notify(sender) => {
+                self.watch = Some(sender);
+                Box::pin(async { Ok(None) })
             }
         }
+    }
+}
 
+mod test {
+    use anyhow::Result;
+    use actix_rt::System;
+    use actix_rt::time::sleep;
+    use std::time::Duration;
 
+    #[test]
+    pub fn test_watch() -> Result<()> {
+        System::new().block_on(async {
+            use tokio::sync::watch;
+
+            let (tx, mut rx) = watch::channel("hello");
+
+            tokio::spawn(async move {
+                while rx.changed().await.is_ok() {
+                    println!("received = {:?}", *rx.borrow());
+                }
+            });
+
+            tx.send("world")?;
+            sleep(Duration::from_secs(1)).await;
+            Ok(())
+        })
     }
 }

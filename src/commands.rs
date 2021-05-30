@@ -1,9 +1,6 @@
 #[allow(dead_code)]
 
-use num_derive::{FromPrimitive, ToPrimitive};
-use crate::protos::init_connect;
-use crate::protos::keep_alive;
-use crate::protos::get_global_state;
+use crate::protos::*;
 
 pub trait ProtoCommand
     where Self: prost::Message + Sized
@@ -40,6 +37,7 @@ pub enum ProtoId {
 
 define_command!(InitConnect, init_connect);
 define_command!(KeepAlive, keep_alive);
+pub type Notify = crate::protos::notify::S2c;
 define_command!(GetGlobalState, get_global_state);
 
 

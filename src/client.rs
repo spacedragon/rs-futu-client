@@ -5,6 +5,9 @@ use bytes::BytesMut;
 use anyhow::Result;
 use crate::client_actor::{ClientActor, Command};
 use crate::commands::*;
+use log::error;
+use tokio::sync::{watch};
+
 
 pub enum ClientRequest {
     InitConnect(u32, protos::init_connect::Request),
@@ -18,18 +21,20 @@ pub enum ClientResponse {
 
 pub struct Client {
     addr: Addr<ClientActor>,
+    watch: Option<watch::Receiver<Notify>>
 }
 
 impl Client {
     pub async fn connect(addr: &str) -> Self {
         let addr = ClientActor::start(addr);
         let mut c = Client {
-            addr
+            addr,
+            watch: None
         };
         let client_id = uuid::Uuid::new_v4().to_string();
         let init = protos::init_connect::C2s {
             client_id,
-            recv_notify: None,
+            recv_notify: Some(true),
             programming_language: Some("rust".to_string()),
             client_ver: 001,
             push_proto_fmt: Some(0),
@@ -39,7 +44,9 @@ impl Client {
         if let Ok(Some(resp)) = c.send_command(init).await {
             if let Some(s2c) = resp.s2c {
                 let keep_alive = Command::KeepAlive(Duration::from_secs(s2c.keep_alive_interval as u64));
-                c.addr.send(keep_alive).await;
+                if let Err(e) = c.addr.send(keep_alive).await {
+                    error!("send keep alive request failed. {}", e);
+                };
             }
         }
         c
@@ -50,7 +57,7 @@ impl Client {
         self.send_request(S::PROTO_ID, &msg).await
     }
 
-    pub async fn send_request<S: prost::Message, R: prost::Message + Default>(&mut self, cmd_id: ProtoId, msg: &S) -> Result<Option<R>> {
+    async fn send_request<S: prost::Message, R: prost::Message + Default>(&mut self, cmd_id: ProtoId, msg: &S) -> Result<Option<R>> {
         let mut body = BytesMut::with_capacity(msg.encoded_len());
         msg.encode(&mut body)?;
         let resp = self.addr.send(Command::Request(cmd_id as u32, body)).await??;
@@ -59,6 +66,17 @@ impl Client {
             Ok(Some(resp))
         } else {
             Ok(None)
+        }
+    }
+
+    pub async fn notification(&mut self) -> watch::Receiver<Notify> {
+        if let Some(receiver) = &self.watch {
+            receiver.clone()
+        } else {
+            let (sender,receiver) = watch::channel(Notify::default());
+            self.addr.send(Command::Notify(sender)).await
+                .expect("set notify failed").expect("set notify failed");
+            receiver.clone()
         }
     }
 }
