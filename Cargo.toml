@@ -29,5 +29,8 @@ log = "0.4.14"
 backoff = "0.3.0"
 derive_more = "0.99.14"
 env_logger = "0.8.3"
+async-stream = "0.3.2"
+tokio-stream = "0.1.6"
+
 [build-dependencies]
 prost-build = { version = "0.7.0" }

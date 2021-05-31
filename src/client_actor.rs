@@ -6,17 +6,16 @@ use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
 use log::{debug, error, log_enabled, info, warn, Level};
 use tokio::io::{split, WriteHalf};
-use tokio::sync::{watch, oneshot};
+use tokio::sync::{watch, oneshot, broadcast};
 use tokio_util::codec::FramedRead;
 use crate::codec::{Payload, ClientCodec};
 use intmap::IntMap;
-use tokio::sync::oneshot::{Sender};
 use anyhow::{Result, Error};
 use crate::{ClientError, protos};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::BytesMut;
-use crate::commands::{ProtoId, Notify};
+use crate::commands::{ProtoId, Notify, SubId};
 use num_traits::*;
 
 type Resp = Option<Payload>;
@@ -27,6 +26,7 @@ pub enum Command {
     Request(u32, BytesMut),
     KeepAlive(Duration),
     Notify(watch::Sender<Notify>),
+    Subscribe(broadcast::Sender<Payload>),
 }
 
 impl Message for Command {
@@ -39,9 +39,10 @@ pub struct ClientActor {
     connector: BoxService<Connect<String>, Connection<String, TcpStream>, ConnectError>,
     backoff: ExponentialBackoff,
     cell: Option<actix::io::FramedWrite<Req, WriteHalf<TcpStream>, ClientCodec>>,
-    promises: IntMap<Sender<Result<Resp>>>,
+    promises: IntMap<oneshot::Sender<Result<Resp>>>,
     seq_no: AtomicU32,
     watch: Option<watch::Sender<Notify>>,
+    subscription: Option<broadcast::Sender<Payload>>,
 }
 
 impl ClientActor {
@@ -62,6 +63,7 @@ impl ClientActor {
             promises: IntMap::new(),
             seq_no: AtomicU32::new(1),
             watch: None,
+            subscription: None,
         })
     }
 
@@ -178,7 +180,7 @@ impl StreamHandler<Result<Payload, Error>> for ClientActor {
                         Some(ProtoId::Notify) => {
                             if let Some(sender) = &self.watch {
                                 use prost::Message;
-                                if let Ok(notify) =  Notify::decode(val.body) {
+                                if let Ok(notify) = Notify::decode(val.body) {
                                     if let Err(e) = sender.send(notify) {
                                         error!("send notify failed. {}", e);
                                     }
@@ -190,8 +192,18 @@ impl StreamHandler<Result<Payload, Error>> for ClientActor {
                             };
                         }
                         _ => {
-                            if log_enabled!(Level::Warn) {
-                                warn!("unhandled server response proto:id {}, seq_no: {}", val.proto_id, val.serial_no);
+                            if let Some(_) = SubId::from_u32(val.proto_id) {
+                                if let Some(subs) = &self.subscription {
+                                    if let Err(e) = subs.send(val) {
+                                        error!("send subscription failed {}", e)
+                                    }
+                                } else {
+                                    debug!("subscription ignored, no receiver.")
+                                }
+                            } else {
+                                if log_enabled!(Level::Warn) {
+                                    warn!("unhandled server response proto:id {}, seq_no: {}", val.proto_id, val.serial_no);
+                                }
                             }
                         }
                     };
@@ -229,6 +241,10 @@ impl Handler<Command> for ClientActor {
             }
             Command::Notify(sender) => {
                 self.watch = Some(sender);
+                Box::pin(async { Ok(None) })
+            }
+            Command::Subscribe(sender) => {
+                self.subscription = Some(sender);
                 Box::pin(async { Ok(None) })
             }
         }

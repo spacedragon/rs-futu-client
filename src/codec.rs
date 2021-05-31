@@ -7,7 +7,7 @@ use anyhow::Result;
 
 pub struct ClientCodec;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Payload {
     pub proto_id: u32,
     pub serial_no: u32,

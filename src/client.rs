@@ -6,8 +6,10 @@ use anyhow::Result;
 use crate::client_actor::{ClientActor, Command};
 use crate::commands::*;
 use log::error;
-use tokio::sync::{watch};
+use tokio::sync::{watch, broadcast};
+use crate::codec::Payload;
 
+const DEFAULT_SUB_SIZE: usize = 16;
 
 pub enum ClientRequest {
     InitConnect(u32, protos::init_connect::Request),
@@ -21,7 +23,8 @@ pub enum ClientResponse {
 
 pub struct Client {
     addr: Addr<ClientActor>,
-    watch: Option<watch::Receiver<Notify>>
+    watch: Option<watch::Receiver<Notify>>,
+    sub: Option<broadcast::Sender<Payload>>
 }
 
 impl Client {
@@ -29,7 +32,8 @@ impl Client {
         let addr = ClientActor::start(addr);
         let mut c = Client {
             addr,
-            watch: None
+            watch: None,
+            sub: None
         };
         let client_id = uuid::Uuid::new_v4().to_string();
         let init = protos::init_connect::C2s {
@@ -78,6 +82,35 @@ impl Client {
                 .expect("set notify failed").expect("set notify failed");
             receiver.clone()
         }
+    }
+
+    pub async fn subscribe<S: SubscribeCommand + ProtoCommand>(&mut self, sub: S) -> Result<impl Stream<Item = S::SubResult>> {
+        let mut rx = if self.sub.is_none() {
+            let (tx, rx) = broadcast::channel(DEFAULT_SUB_SIZE);
+            self.sub = Some(tx.clone());
+            self.addr.send(Command::Subscribe(tx)).await
+                .expect("set subscription failed").expect("set subscription failed");
+            rx
+        } else {
+            self.sub.as_ref().unwrap().subscribe()
+        };
+        self.send_command(sub).await?;
+
+        let stream = async_stream::stream! {
+            let mut received = rx.recv().await;
+            while Err(broadcast::error::RecvError::Closed) != received {
+                if let Ok(payload) = received {
+                    if payload.proto_id == S::SUB_ID as u32 {
+                        use prost::Message;
+                        if let Ok(result) = S::SubResult::decode(payload.body) {
+                            yield result;
+                        }
+                    }
+                }
+                received = rx.recv().await
+            }
+        };
+        Ok(stream)
     }
 }
 
